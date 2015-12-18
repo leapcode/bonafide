@@ -18,10 +18,17 @@
 Configuration for a LEAP provider.
 """
 import datetime
+import json
 import os
 import sys
 
+from twisted.internet import reactor
+from twisted.internet.ssl import ClientContextFactory
+from twisted.python import log
+from twisted.web.client import Agent, downloadPage
+
 from leap.bonafide._http import httpRequest
+from leap.bonafide.provider import Discovery
 
 from leap.common.check import leap_assert
 from leap.common.config import get_path_prefix as common_get_path_prefix
@@ -45,8 +52,15 @@ def get_provider_path(domain):
     :returns: the path
     :rtype: str
     """
-    leap_assert(domain is not None, "get_provider_path: We need a domain")
-    return os.path.join("leap", "providers", domain, "provider.json")
+    # TODO sanitize domain
+    leap_assert(domain is not None, 'get_provider_path: We need a domain')
+    return os.path.join('providers', domain, 'provider.json')
+
+
+def get_ca_cert_path(domain):
+    # TODO sanitize domain
+    leap_assert(domain is not None, 'get_provider_path: We need a domain')
+    return os.path.join('providers', domain, 'keys', 'ca', 'cacert.pem')
 
 
 def get_modification_ts(path):
@@ -99,28 +113,67 @@ def make_address(user, provider):
     :param provider: the provider domain
     :type provider: basestring
     """
-    return "%s@%s" % (user, provider)
+    return '%s@%s' % (user, provider)
 
 
 def get_username_and_provider(full_id):
     return full_id.split('@')
 
 
-class ProviderConfig(object):
-    # TODO add file config for enabled services
+class WebClientContextFactory(ClientContextFactory):
+    def getContext(self, hostname, port):
+        return ClientContextFactory.getContext(self)
 
-    def __init__(self, domain):
-        self._api_base = None
+
+class ProviderConfig(object):
+
+    # TODO add validation
+    # TODO split this class: ProviderBootstrap, ProviderConfig
+
+    def __init__(self, domain, autoconf=True, basedir='~/.config/leap',
+                 check_certificate=True):
         self._domain = domain
+        self._basedir = os.path.expanduser(basedir)
+        self._disco = Discovery('https://%s' % domain)
+        self._provider_config = {}
+
+        if not check_certificate:
+            # XXX we should do this only for the FIRST provider download.
+            # For the rest, we should pass the ca cert to the agent.
+            self.contextFactory = WebClientContextFactory()
+        else:
+            self.contextFactory = None
+        self._agent = Agent(reactor, self.contextFactory)
+
+        self._load_provider_config()
+        # TODO if loaded, setup _get_api_uri on the DISCOVERY
+
+        if not self.is_configured() and autoconf:
+            print 'provider %s not configured: downloading files...' % domain
+            self.bootstrap()
 
     def is_configured(self):
         provider_json = self._get_provider_json_path()
         # XXX check if all the services are there
-        if is_file(provider_json):
-            return True
-        return False
+        if not is_file(provider_json):
+            return False
+        if not is_file(self._get_ca_cert_path()):
+            return False
+        return True
 
-    def download_provider_info(self):
+    def bootstrap(self):
+        provider_json = self._get_provider_json_path()
+        if not is_file(provider_json):
+            self.download_provider_info()
+        if not is_file(self._get_ca_cert_path()):
+            self.download_ca_cert()
+            self.validate_ca_cert()
+        self.download_services_config()
+
+    def has_valid_certificate(self):
+        pass
+
+    def download_provider_info(self, replace=False):
         """
         Download the provider.json info from the main domain.
         This SHOULD only be used once with the DOMAIN url.
@@ -128,8 +181,24 @@ class ProviderConfig(object):
         # TODO handle pre-seeded providers?
         # or let client handle that? We could move them to bonafide.
         provider_json = self._get_provider_json_path()
-        if is_file(provider_json):
+        print 'PROVIDER JSON', provider_json
+        if is_file(provider_json) and not replace:
             raise RuntimeError('File already exists')
+
+        folders, f = os.path.split(provider_json)
+        mkdir_p(folders)
+
+        uri = self._disco.get_provider_info_uri()
+        met = self._disco.get_provider_info_method()
+
+        def print_info(res):
+            print "RES:", res
+
+        d = downloadPage(uri, provider_json, method=met)
+        d.addCallback(print_info)
+        d.addCallback(lambda _: self._load_provider_config())
+        d.addErrback(log.err)
+        return d
 
     def update_provider_info(self):
         """
@@ -137,16 +206,56 @@ class ProviderConfig(object):
         """
         pass
 
-    def _http_request(self, *args, **kw):
-        # XXX pass if-modified-since header
-        return httpRequest(*args, **kw)
+    def download_ca_cert(self):
+        uri = self._get_ca_cert_uri()
+        path = self._get_ca_cert_path()
+        mkdir_p(os.path.split(path)[0])
+        d = downloadPage(uri, path)
+        d.addErrback(log.err)
+        return d
+
+    def validate_ca_cert(self):
+        # XXX Need to verify fingerprint against the one in provider.json
+        expected =  self._get_expected_ca_cert_fingerprint()
+        print "EXPECTED FINGERPRINT:", expected
+
+    def _get_expected_ca_cert_fingerprint(self):
+        return self._provider_config.get('ca_cert_fingerprint', None)
+
+    def download_services_config(self):
+        pass
 
     def _get_provider_json_path(self):
         domain = self._domain.encode(sys.getfilesystemencoding())
-        provider_json = os.path.join(get_path_prefix(), get_provider_path(domain))
+        provider_json = os.path.join(self._basedir, get_provider_path(domain))
         return provider_json
 
+    def _get_ca_cert_path(self):
+        domain = self._domain.encode(sys.getfilesystemencoding())
+        cert_path = os.path.join(self._basedir, get_ca_cert_path(domain))
+        return cert_path
+
+    def _get_ca_cert_uri(self):
+        uri = self._provider_config.get('ca_cert_uri', None)
+        if uri:
+            uri = str(uri)
+        return uri
+
+    def _load_provider_config(self):
+        path = self._get_provider_json_path()
+        if not is_file(path):
+            return
+        with open(path, 'r') as config:
+            self._provider_config = json.load(config)
+
+    def _http_request(self, *args, **kw):
+        # XXX pass if-modified-since header
+        return httpRequest(self._agent, *args, **kw)
+
+    def _get_api_uri(self):
+        pass
+
+
 if __name__ == '__main__':
-    config = ProviderConfig('cdev.bitmask.net')
-    config.is_configured()
-    config.download_provider_info()
+    config = ProviderConfig('cdev.bitmask.net', check_certificate=False)
+    reactor.run()

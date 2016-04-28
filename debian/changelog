@@ -1,0 +1,5 @@
+leap-bonafide (0.0.2) unstable; urgency=low
+
+  * Initial Debian package
+
+ -- Micah Anderson <micah@debian.org>  Wed, 27 Apr 2016 22:09:01 -0400

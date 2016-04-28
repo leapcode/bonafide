@@ -84,7 +84,4 @@ setup(
     install_requires=parsed_reqs,
     include_package_data=True,
     zip_safe=False,
-    entry_points={
-        'console_scripts': [bonafide_cli]
-    },
 )
